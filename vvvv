@@ -1,0 +1,1226 @@
+--[[
+    vanta.lol v8.0 - aimbot + skeleton ESP
+
+    Changes vs v7.1:
+      * Silent Aim removed completely (hooks, settings, tab).
+      * GENERAL and STYLE tabs removed. Menu key is fixed to RightShift, the accent color is always white.
+      * ESP reduced to Skeleton + Distance. Distance is shown in "M" (white).
+      * Config: Save / Load removed. Reset and Unload live here now.
+      * Tab animations are always on (the toggle is gone).
+      * New header: logo + "vanta.lol" wordmark. The window clips its content, so all corners are smooth.
+]]
+
+-- ============================================================
+-- Services & constants
+-- ============================================================
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    warn("[vanta.lol] LocalPlayer is unavailable.")
+    return
+end
+
+local VERSION = "8.0"
+local GUI_NAME = "VantaLolUI_v80"
+local RENDER_STEP_NAME = "VantaLolFeatures"
+local MENU_KEY = Enum.KeyCode.RightShift
+local WHITE = Color3.fromRGB(255, 255, 255)
+local OLD_GUI_NAMES = {
+    GUI_NAME, "VantaLolUI_v71", "VantaLolUI_v70", "VantaLolUI_v66", "VantaLolUI_v65",
+    "VantaLolUI_v64", "VantaLolUI_v63", "VantaLolUI_v62", "VantaLolUI_v61",
+}
+
+-- Every input connection goes through this proxy so Unload can disconnect all of them.
+local Runtime = {Connections = {}, Unload = function() end}
+local Input = {}
+for _, signalName in ipairs({"InputBegan", "InputChanged", "InputEnded"}) do
+    Input[signalName] = {
+        Connect = function(_, callback)
+            local connection = UserInputService[signalName]:Connect(callback)
+            table.insert(Runtime.Connections, connection)
+            return connection
+        end,
+    }
+end
+
+-- Re-execute support: shut the previous instance down first.
+local globalEnv = (type(getgenv) == "function" and getgenv()) or _G
+if type(globalEnv.__VantaLolCleanup) == "function" then
+    pcall(globalEnv.__VantaLolCleanup)
+end
+
+-- ============================================================
+-- GUI parent
+-- ============================================================
+local function findGuiParent()
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok and hidden then return hidden, "gethui()" end
+    end
+
+    local ok = pcall(function()
+        local probe = Instance.new("Folder")
+        probe.Parent = CoreGui
+        probe:Destroy()
+    end)
+    if ok then return CoreGui, "CoreGui" end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if playerGui then return playerGui, "PlayerGui" end
+    return nil, "none"
+end
+
+local GuiParent, GuiParentName = findGuiParent()
+if not GuiParent then
+    warn("[vanta.lol] Could not find a GUI parent.")
+    return
+end
+
+for _, name in ipairs(OLD_GUI_NAMES) do
+    local old = GuiParent:FindFirstChild(name)
+    if old then pcall(function() old:Destroy() end) end
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = GUI_NAME
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999999
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
+local parentOk, parentError = pcall(function() ScreenGui.Parent = GuiParent end)
+if not parentOk or ScreenGui.Parent ~= GuiParent then
+    pcall(function() ScreenGui:Destroy() end)
+    warn("[vanta.lol] Could not parent ScreenGui: " .. tostring(parentError))
+    return
+end
+
+-- ============================================================
+-- Settings
+-- ============================================================
+local Defaults = {
+    -- Aimbot
+    Aimbot = false,
+    AimbotActivation = "RMB",
+    AimbotMode = "Camera",
+    AimbotFOV = 180,
+    AimbotSmoothness = 0.25,
+    AimbotPrediction = 0,
+    AimbotTracking = 0.8,
+    AimbotMaxDistance = 1000,
+    AimbotPart = "Head",
+    TeamCheck = true,
+    VisibleCheck = true,
+    ShowFOV = false,
+
+    -- ESP
+    ESPSkeleton = false,
+    SkeletonThickness = 1.5,
+    ESPDistance = false,
+}
+
+local Settings = {}
+for key, value in pairs(Defaults) do
+    Settings[key] = value
+end
+
+-- ============================================================
+-- Look & small helpers
+-- ============================================================
+local Colors = {
+    Background = Color3.fromRGB(9, 9, 11),
+    Panel = Color3.fromRGB(15, 15, 18),
+    Border = Color3.fromRGB(30, 30, 35),
+    Text = Color3.fromRGB(240, 241, 245),
+    Muted = Color3.fromRGB(135, 138, 148),
+    Off = Color3.fromRGB(44, 44, 50),
+    Track = Color3.fromRGB(38, 38, 43),
+    Green = Color3.fromRGB(75, 220, 150),
+    Red = Color3.fromRGB(245, 90, 100),
+}
+
+local Fonts = {
+    Regular = Enum.Font.BuilderSans,
+    Medium = Enum.Font.BuilderSansMedium,
+    Bold = Enum.Font.BuilderSansBold,
+    Title = Enum.Font.Michroma, -- wordmark only
+}
+
+local Refreshers = {} -- callbacks that re-sync the controls with Settings (used by Reset)
+
+local function round(instance, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius or 8)
+    corner.Parent = instance
+    return corner
+end
+
+local function stroke(instance, color, thickness, transparency)
+    local outline = Instance.new("UIStroke")
+    outline.Color = color or Colors.Border
+    outline.Thickness = thickness or 1
+    outline.Transparency = transparency or 0
+    outline.Parent = instance
+    return outline
+end
+
+local function makeLabel(parent, text, position, size, textSize, color, font, align)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Position = position
+    label.Size = size
+    label.Font = font or Fonts.Regular
+    label.Text = text or ""
+    label.TextColor3 = color or Colors.Text
+    label.TextSize = textSize or 13
+    label.TextXAlignment = align or Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.Parent = parent
+    return label
+end
+
+-- ============================================================
+-- Toast notifications (bottom center)
+-- ============================================================
+local notify
+do
+    local holder = Instance.new("Frame")
+    holder.Name = "Toasts"
+    holder.AnchorPoint = Vector2.new(0.5, 1)
+    holder.Position = UDim2.new(0.5, 0, 1, -28)
+    holder.Size = UDim2.fromOffset(320, 220)
+    holder.BackgroundTransparency = 1
+    holder.ZIndex = 60
+    holder.Parent = ScreenGui
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.Parent = holder
+
+    local fade = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local counter = 0
+
+    notify = function(text, kind)
+        counter = counter + 1
+        local accent = WHITE
+        if kind == "error" then accent = Colors.Red elseif kind == "success" then accent = Colors.Green end
+
+        local toast = Instance.new("TextLabel")
+        toast.LayoutOrder = counter
+        toast.Size = UDim2.fromOffset(280, 32)
+        toast.BackgroundColor3 = Colors.Panel
+        toast.BackgroundTransparency = 1
+        toast.BorderSizePixel = 0
+        toast.Font = Fonts.Medium
+        toast.Text = tostring(text)
+        toast.TextColor3 = Colors.Text
+        toast.TextTransparency = 1
+        toast.TextSize = 13
+        toast.TextTruncate = Enum.TextTruncate.AtEnd
+        toast.ZIndex = 61
+        toast.Parent = holder
+        round(toast, 16)
+        local toastStroke = stroke(toast, accent, 1, 1)
+
+        TweenService:Create(toast, fade, {BackgroundTransparency = 0.05, TextTransparency = 0}):Play()
+        TweenService:Create(toastStroke, fade, {Transparency = 0.45}):Play()
+
+        task.delay(2.4, function()
+            pcall(function()
+                TweenService:Create(toast, fade, {BackgroundTransparency = 1, TextTransparency = 1}):Play()
+                TweenService:Create(toastStroke, fade, {Transparency = 1}):Play()
+            end)
+            task.delay(0.3, function() pcall(function() toast:Destroy() end) end)
+        end)
+    end
+end
+
+-- ============================================================
+-- Logo (embedded PNG -> written to the executor workspace -> getcustomasset)
+-- ============================================================
+local LOGO_BASE64 = [==[iVBORw0KGgoAAAANSUhEUgAAAIAAAAB9CAMAAABd7Js+AAABIFBMVEVbW1xgX2Gam5uamZpdXWagoKBWVleUlJQ2NjcyMTI5ODrExMVAP0HQ0NEgHyH//wDT09Q/P18/P0EA/wBVVap/gIG/v/+/v8C/wcHAvsDMzMwAAAD7+/vn5+jIx8jW1teop6m3triIh4mXlphoZ2n///92dnhJSEpXV1k2NTcpKSpVVVV/f3+/v78AAAEEBAQ9PT0YGBm1tbaqqqq7urve3uANDA4mJicFBQYEBAUDAwQGBge+vsAlJSY1NTZ+fYAWFhbg3+AeHiCgnqC4uLgWFhgWFhdLS0tgXmFpaGmenaDAv8DDw8QVFRcnJyc4ODk+PkB4eHmAfoGWlpcVFBYaGRsoJygnJykkJCUoJylDQkNeXWBoaGiHh4iqqarU1NU8uk4IAAAAYHRSTlOgX2iVKM/OF2ItrKD9d/0B2wjAAQP/BN2ApgUA/f38/fz8+/37Afz6+/v7BAIELVAE+pUDpfz5zI6vcM79rtP7M/35/W6QrhH8af39qm0Wiv21/NZL0ixRc5NN/Aq2qstHxWzKAAAKxklEQVR42sVaZ0PbyhI1LaTee18v24tXxUayQkzvkBAgIYT0l9zk//+LNyvLYAlJlmTA+wUHnJ2zZ+rOTgtNZS1ffWpNQ3x75PP9A2hb8bOLQxStKYhfPPpjdnl5OgwsgfqPFtgc6k5FBXD63jPB2awFcv8ALOnPGJdw/qUpGGEXjn/0B9UKz03DC6ztzf4i0hH4z5T8ewIAlM8/IcJx+1n59wIAlH/+hFDtGYwXMvLvAUDMPgH2PYXxB3TtgPcEAOTN/MLc9TyOMQ9QB90rALD9RzH7nidA/h7qoXsFkLAP4j2K8daXLP93DACOP/8GCwfE+1sYs4foB7pPAEv2+Myy7/mgf9LKOf8dArDH/4WV4/ueF0mM8YOsA94tADj+EaGu72nlHbggXwZ5KDt3BcAenxnPVQxT32MYi7dpB+h2ukvtO2MAfP2IKkeD52Fs/NPYAAbyu92/g+ShMuZnOi20vJS32jdX5hvLJbGn84K7mlrxmDjaokD/7bbbo0YwPzP3k/KT+dZdxL7FBZOIh+DjwCfx8eqvj2ZO5uZe/IuCWrCYBxX8mH3+5Plwzc0NP70YWf95Y9eLF8+v17+Pnh0t5svvodldzfFwGesBsjU7N/fz58ICZftXfyHvLdhWd/HoFy5aJLNG/tSf7XYL5Gtz/UVmqWBX2zFGBVeSwxdoKzaWWAUzPylTeri+u8lysgt+9xq+YIwkb46Lzn/i8hGcHAhgUhoD/+91sm9snPwrSrygbQu0vTluE9Zg+clK/jmQbOXuSqm44K4hP0cvNyn9z5hRnsglEMC1Hp7J/f5aK/sFEyYbxAwsWywzH6QNW34i8rU9qFKciy1KGRuhX7sEyrpugXxOqDJyaIJCWTUwSkWyaGx9xA2GcTnxgq6l4US6vsyo+uYyHv1QIL/TPpELrTAIV63p230UzduC7gRXYak1Wjmgluu55eIx94y4WVYMEZzMD376MgbAVO4W2wW5ACB8fuD7vBSA9nhBWkmCMMT3Hto21oMwFzk7yFfnhckIIDz0I1lCAnEuRCtfAfHRu4NQHAPARN3YiWC93i67F7TR3qqvWSEE4nqilIEEgMSwhxA3A4u7PiYdg3Fs+5qyQhVcSBG0O2PC8SoHADcJICwrPz8bvvNMIQLuuqyFlsvlH/uUMCyy1gTV6fpiBQAdQCBpgRaIcThQUK6BPScmYD/rfmazWlXcQ489TgsoEFqPoaCH3oIJ3HQBqqK9iiVZtwOhpEAJRLqcjzHDVQp5R2Y2YMIPq9eEjwaukEcDNYblV7jDtedCEFAZC2DUXatelPbQNx9yJskNCUqLMgpAAxAARYYAQuV6rar4+BMEZa7z9ADplc2UUbDD4DsZAiiPUL2y/EvE8WtH5NqhPFsopKCDPmqIgRkCKHXCGgCWIaC3NzXzHJlrh0oVUwBhUEAdwjMGYNZQZQC9uNpph56Be0WuL1BpU3IRdy78XbG0AYhPqDKA7vG7P2ftPWYV6pN8HWCuaAEFPfSSY5khABQQVAdgf0upbH1dj3zvIj81MlVMgYP5btoCYLc1VAsA2ra1rHKfehcmPyIKTv93s9sQ+yDvmzQBRGytFjpNkRd8iregl0kNedMOeT4FbfSASJMmQFAdopoMoOCAk4G5yXwKqAAKOjcJCBXVaQIo5a9QbQAo8AUZ8MfzKRAsJxZ00V9phgAmqFMSN4sDUegIlvhwZQo6KJAiQ4CgagM1YAChNZ0gKKgMcijooMfCmFQMAJw7ZWG7BMCPTSlYSX3MhHiYoeD3wHAtRVpTJkTNGAAz4LzslkBZpvHbQd+4NCm3ofRsFXUaArBmUIYAAmzWCnSGALbFdIBQSQFV3qBYN6UcWAqWR33w60KaAAKXwm3AuISO5xsBQBE/LEEAFDwaoQCCUIYAuIpqKGDbaOZ9p90IAChBliBg7P21FUAQkmkCGGXipW2PzoqZIkMY1yNal7wMAeWfry4p0G7hRp6lFNC3BARzpLiMHgPgbxAQZQkCS8HyVRAyyvAMAd+g8SCwLA6FY7tkG1pks3sKwRUFcJ3hZjRxQEOIaLS3AKXll2JPHAugs3moBgjyUwIdsvs7+GCaAEboq5aAWNRq7IaxHXrUKGvb+VdmS0Hig6cyS4BSNhTIoGkgurJDA4U4+FQZBW3k8stRAsj+IJ9z8a4sFFYAEESQ4aWCWjjfCqS9qtrbiEoRELeaIJlTXXqPq9Kq3dDUtUqQLL8wsBTYIDTqLSQ5vqI8bJ4LkvWXTbGrleyf5lNADWrbIJQmwCqHq0MOybiDJgSAwgvmgCcIk+8Iyj4GPU4TEJ8e5DMTlO9drVu+rrh3KrnOjwcCSi4oBFLFIwPx0Oak9GU5ARUBBAfMBSVone+J5ivaTkdsqmL5grjjGloV3wvWNPOl0m4+BWon0CkCxFA+38i7PDQAcL5Cjc+Nm28F1PmUImAon5HScrDWq9mGQ3x96ORTQICaS3qDf4p3w7EbVwUwv3koIqWdfCuQWl7XAWwgn0OnbhV1bgsACv19x5cFFIjRQogn8hn+HqBbY8DWhyyCh4RcCsgIAeJKvng1noAaAPYiursCbxmnuf0CnlIAtwaInaB9mwygNZd4v3lObs/kuqkoDtWplb+P+VoFAuoAOF8RHFoW+W2jKwIOOSwBjV7ijXXBuk+3GxfEiXzHpWUPKol8guXYGFQbwPGmEpaC3ZKrSiz/DDRSIQbVf74PfeKuFDau4r4JiIdnNrBAE1bbsxaAf25KGh34T3UxAYOXOeiUrlYjoObzfegzbSkoKNNJ8jIIBOiKBNSdH7AUgBnk5yRoRsSvnGABdLuKCzYAEPp9awWGFxBAQb6A25kboLthAIEjrER+phN73Y4C+gW0NisF4WYAQod5EXRO8iigsXz7Nl4pCDecotmkZsUXIocCZuVzA9mKv6xMQH0AoeQrHvQeeU4+6FNlRxYrBuGmc0QOjRxojfAsBX26D08pdmQFgnDnzgBAI0x4GujOPsvCXRTkaxiaYzs1CKgNAK5AHPJhHxCknyRYn+2aeGiycgxqqIIgVjMgSF/F96nRxntK67hgw0kq47J4HuaMjbYCqPluHN/UiUFNATwwg4mcKwrg+H0KdwbXdxg+fVmLgEYAeDITNHjfJsx+NDBm48PgRi0XbAhgB2ZD7MN0n7GBfLAHA0M3vu9AGbBRj4BGNkC0/ynS1gxIfHyQr13jHcD0ydlqTfkN4sAX8xj87OOKtrbXJ9CNZFY+VIuuTQJ1j9OqPSr38GP8Yy/awvvMyidSf9c68mFwVa3VJaDRQGM7uSZYQ9yCK7gdL4uiyFSvwyYDkJzxPKL20cQqQEt/5Tevj92w/m4TDDSuGVuDWQKks3JwoKwCevcJAHng/wIsYFevRJGLmd9kk0kArAv7InFpJNSpPm2kgIkAtEPQAaOXCsrUA9lMAROO9XrY1qDKhwsjZrVD0MQAOugVdGEE3wUFiAYh6BYY2ODWEV0fsvA/NtAUAAQQewT3QAHwNtWbAgCYFmFU+VAH7jQzgAkBtFHLDsj5Guug8SaTAIBxK0hGjkNUiKYE4C3MzPmcNTaAiQGEFBuXtOrnwNsB0LEAHCZRG00HAFwUKVUibOwBt8EAh4mqHpoagI8C3o67aHoAvjA+kQFMCKCLTvKGme4TQGtSBUwK4N3nCRUwoRv2ztHE6/8FlR3wZW7VEAAAAABJRU5ErkJggg==]==]
+
+local LogoAsset = (function()
+    local getAsset = getcustomasset or getsynasset
+    if type(writefile) ~= "function" or type(getAsset) ~= "function" then return nil end
+
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local lookup = {}
+    for i = 1, #alphabet do lookup[alphabet:byte(i)] = i - 1 end
+
+    local ok, asset = pcall(function()
+        local bytes, count, bits, value = {}, 0, 0, 0
+        for i = 1, #LOGO_BASE64 do
+            local sextet = lookup[LOGO_BASE64:byte(i)]
+            if sextet then
+                value = value * 64 + sextet
+                bits = bits + 6
+                if bits >= 8 then
+                    bits = bits - 8
+                    local divisor = 2 ^ bits
+                    count = count + 1
+                    bytes[count] = string.char(math.floor(value / divisor))
+                    value = value % divisor
+                end
+            end
+        end
+        writefile("vanta_logo.png", table.concat(bytes))
+        return getAsset("vanta_logo.png")
+    end)
+    if ok and type(asset) == "string" and asset ~= "" then return asset end
+    return nil
+end)()
+
+-- ============================================================
+-- Main window
+-- ============================================================
+local TabNames = {"AIMBOT", "ESP", "CONFIG"}
+local TabButtons, Pages = {}, {}
+local activeTab = 1
+local menuOpen = false
+
+local MAIN_SIZE = UDim2.fromOffset(600, 430)
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.AnchorPoint = Vector2.new(0.5, 0.5)
+Main.Position = UDim2.fromScale(0.5, 0.5)
+Main.Size = MAIN_SIZE
+Main.BackgroundColor3 = Colors.Background
+Main.BorderSizePixel = 0
+Main.ClipsDescendants = true -- children are clipped to the rounded shape, so no square corners poke out
+Main.Visible = false
+Main.Active = true
+Main.Parent = ScreenGui
+round(Main, 16)
+stroke(Main, WHITE, 1, 0.88)
+
+local MainScale = Instance.new("UIScale")
+MainScale.Scale = 1
+MainScale.Parent = Main
+
+-- Header: logo + wordmark + close button
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Active = true
+Header.Size = UDim2.new(1, 0, 0, 58)
+Header.BackgroundTransparency = 1
+Header.BorderSizePixel = 0
+Header.Parent = Main
+
+if LogoAsset then
+    local logo = Instance.new("ImageLabel")
+    logo.Name = "Logo"
+    logo.BackgroundTransparency = 1
+    logo.Position = UDim2.fromOffset(18, 12)
+    logo.Size = UDim2.fromOffset(36, 35)
+    logo.Image = LogoAsset
+    logo.ScaleType = Enum.ScaleType.Fit
+    logo.Parent = Header
+else
+    -- Executor has no getcustomasset(): fall back to a bold "V" glyph.
+    makeLabel(Header, "V", UDim2.fromOffset(18, 10), UDim2.fromOffset(36, 38), 30, WHITE, Fonts.Bold, Enum.TextXAlignment.Center)
+end
+makeLabel(Header, "vanta.lol", UDim2.fromOffset(64, 0), UDim2.new(1, -120, 1, 0), 18, WHITE, Fonts.Title)
+
+local Close = Instance.new("TextButton")
+Close.Name = "Close"
+Close.AnchorPoint = Vector2.new(1, 0.5)
+Close.Position = UDim2.new(1, -16, 0.5, 0)
+Close.Size = UDim2.fromOffset(30, 30)
+Close.BackgroundColor3 = Colors.Panel
+Close.BorderSizePixel = 0
+Close.AutoButtonColor = false
+Close.Font = Fonts.Medium
+Close.Text = "×"
+Close.TextColor3 = Colors.Muted
+Close.TextSize = 20
+Close.Parent = Header
+round(Close, 15)
+Close.MouseEnter:Connect(function()
+    TweenService:Create(Close, TweenInfo.new(0.12), {BackgroundColor3 = Color3.fromRGB(38, 20, 24), TextColor3 = Colors.Red}):Play()
+end)
+Close.MouseLeave:Connect(function()
+    TweenService:Create(Close, TweenInfo.new(0.12), {BackgroundColor3 = Colors.Panel, TextColor3 = Colors.Muted}):Play()
+end)
+
+local function makeDivider(y)
+    local divider = Instance.new("Frame")
+    divider.Position = UDim2.new(0, 0, 0, y)
+    divider.Size = UDim2.new(1, 0, 0, 1)
+    divider.BackgroundColor3 = Colors.Border
+    divider.BorderSizePixel = 0
+    divider.Parent = Main
+end
+makeDivider(58)
+
+-- Tab bar
+local TabBar = Instance.new("Frame")
+TabBar.Position = UDim2.fromOffset(0, 59)
+TabBar.Size = UDim2.new(1, 0, 0, 40)
+TabBar.BackgroundTransparency = 1
+TabBar.BorderSizePixel = 0
+TabBar.Parent = Main
+makeDivider(99)
+
+local TabIndicator = Instance.new("Frame")
+TabIndicator.Position = UDim2.new(0, 14, 1, -2)
+TabIndicator.Size = UDim2.new(1 / #TabNames, -28, 0, 2)
+TabIndicator.BackgroundColor3 = WHITE
+TabIndicator.BorderSizePixel = 0
+TabIndicator.Parent = TabBar
+round(TabIndicator, 1)
+
+local Content = Instance.new("Frame")
+Content.Position = UDim2.fromOffset(16, 112)
+Content.Size = UDim2.new(1, -32, 1, -126)
+Content.BackgroundTransparency = 1
+Content.ClipsDescendants = true
+Content.Parent = Main
+
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 2
+    page.ScrollBarImageColor3 = WHITE
+    page.ScrollBarImageTransparency = 0.6
+    page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    page.ScrollingEnabled = false -- scrolled by the smooth mouse wheel handler below
+    page.CanvasSize = UDim2.new()
+    page.Visible = false
+    page.Parent = Content
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 8)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Parent = page
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 2)
+    padding.PaddingBottom = UDim.new(0, 8)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.Parent = page
+
+    -- Creation order == display order, so rows never stack on top of each other.
+    local counter = 0
+    page.ChildAdded:Connect(function(child)
+        if child:IsA("GuiObject") then
+            counter = counter + 1
+            child.LayoutOrder = counter
+        end
+    end)
+    list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        page.CanvasSize = UDim2.new(0, 0, 0, list.AbsoluteContentSize.Y + 10)
+    end)
+    return page
+end
+
+for i, name in ipairs(TabNames) do
+    local button = Instance.new("TextButton")
+    button.Name = name .. "Tab"
+    button.Position = UDim2.new((i - 1) / #TabNames, 0, 0, 0)
+    button.Size = UDim2.new(1 / #TabNames, 0, 1, -2)
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Font = Fonts.Bold
+    button.Text = name
+    button.TextSize = 13
+    button.TextColor3 = (i == 1) and WHITE or Colors.Muted
+    button.Parent = TabBar
+    TabButtons[i] = button
+    Pages[i] = createPage(name .. "Page")
+end
+
+-- Tab switching: the page slides in and the indicator glides (always on).
+local TabAnimation = {Pages = {}, Indicator = nil}
+
+local function selectTab(index)
+    if not Pages[index] then return end
+    local previous = activeTab
+    local direction = (index >= previous) and 1 or -1
+    activeTab = index
+
+    for i, button in ipairs(TabButtons) do
+        button.TextColor3 = (i == index) and WHITE or Colors.Muted
+        local page = Pages[i]
+        if TabAnimation.Pages[i] then
+            TabAnimation.Pages[i]:Cancel()
+            TabAnimation.Pages[i] = nil
+        end
+
+        if i == index then
+            page.Visible = true
+            if previous ~= index then
+                page.Position = UDim2.fromOffset(direction * 18, 0)
+                local tween = TweenService:Create(page,
+                    TweenInfo.new(0.24, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+                    {Position = UDim2.fromOffset(0, 0)})
+                TabAnimation.Pages[i] = tween
+                tween:Play()
+            else
+                page.Position = UDim2.fromOffset(0, 0)
+            end
+        else
+            page.Visible = false
+            page.Position = UDim2.fromOffset(0, 0)
+        end
+    end
+
+    if TabAnimation.Indicator then TabAnimation.Indicator:Cancel() end
+    TabAnimation.Indicator = TweenService:Create(TabIndicator,
+        TweenInfo.new(0.26, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+        {Position = UDim2.new((index - 1) / #TabNames, 14, 1, -2)})
+    TabAnimation.Indicator:Play()
+end
+
+for i, button in ipairs(TabButtons) do
+    button.MouseButton1Click:Connect(function() selectTab(i) end)
+    button.MouseEnter:Connect(function()
+        if i ~= activeTab then button.TextColor3 = Colors.Text end
+    end)
+    button.MouseLeave:Connect(function()
+        if i ~= activeTab then button.TextColor3 = Colors.Muted end
+    end)
+end
+
+-- Smooth mouse wheel scrolling
+local ScrollTweens = {}
+Input.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
+    local mouse = UserInputService:GetMouseLocation()
+    for _, page in ipairs(Pages) do
+        if page.Visible then
+            local pos, size = page.AbsolutePosition, page.AbsoluteSize
+            local inside = mouse.X >= pos.X and mouse.X <= pos.X + size.X
+                and mouse.Y >= pos.Y and mouse.Y <= pos.Y + size.Y
+            if inside then
+                local maxScroll = math.max(0, page.CanvasSize.Y.Offset - size.Y)
+                local targetY = math.clamp(page.CanvasPosition.Y - input.Position.Z * 92, 0, maxScroll)
+                if ScrollTweens[page] then ScrollTweens[page]:Cancel() end
+                ScrollTweens[page] = TweenService:Create(page,
+                    TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+                    {CanvasPosition = Vector2.new(0, targetY)})
+                ScrollTweens[page]:Play()
+                break
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- UI controls
+-- ============================================================
+local TEXT_RESERVE = 190 -- space kept free on the right for controls
+local TOAST_TOGGLES = {Aimbot = true, ESPSkeleton = true, ESPDistance = true}
+local Drag = {Handler = nil}
+
+-- Shared drag handler for sliders (receives the mouse X in screen space).
+Input.InputChanged:Connect(function(input)
+    if Drag.Handler and input.UserInputType == Enum.UserInputType.MouseMovement then
+        Drag.Handler(UserInputService:GetMouseLocation().X)
+    end
+end)
+Input.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then Drag.Handler = nil end
+end)
+
+local function createRow(parent, title, description, height, reserve)
+    reserve = reserve or TEXT_RESERVE
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, height or 58)
+    row.BackgroundColor3 = Colors.Panel
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    round(row, 10)
+    stroke(row, Colors.Border, 1, 0)
+
+    local titleLabel = makeLabel(row, title, UDim2.fromOffset(14, 8), UDim2.new(1, -reserve, 0, 20), 14, Colors.Text, Fonts.Medium)
+    titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    if description and description ~= "" then
+        local desc = makeLabel(row, description, UDim2.fromOffset(14, 30), UDim2.new(1, -reserve, 0, 18), 12, Colors.Muted, Fonts.Regular)
+        desc.TextTruncate = Enum.TextTruncate.AtEnd
+    end
+    return row
+end
+
+local function createSection(parent, text)
+    return makeLabel(parent, text, UDim2.new(0, 4, 0, 0), UDim2.new(1, -8, 0, 22), 12, Colors.Muted, Fonts.Bold)
+end
+
+-- Small boxed button used by dropdowns and actions.
+local function createRowButton(row, font)
+    local button = Instance.new("TextButton")
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -14, 0.5, 0)
+    button.Size = UDim2.fromOffset(136, 30)
+    button.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Font = font or Fonts.Medium
+    button.TextColor3 = Colors.Text
+    button.TextSize = 12
+    button.Parent = row
+    round(button, 8)
+    stroke(button, Colors.Border, 1, 0)
+
+    local base = button.BackgroundColor3
+    button.MouseEnter:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.12), {BackgroundColor3 = base:Lerp(WHITE, 0.1)}):Play()
+    end)
+    button.MouseLeave:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.12), {BackgroundColor3 = base}):Play()
+    end)
+    return button
+end
+
+local function createToggle(parent, title, description, key)
+    local row = createRow(parent, title, description, 58, 95)
+    local track = Instance.new("TextButton")
+    track.Name = key .. "Toggle"
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, -14, 0.5, 0)
+    track.Size = UDim2.fromOffset(46, 24)
+    track.BorderSizePixel = 0
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = row
+    round(track, 12)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(18, 18)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    round(knob, 9)
+
+    local info = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local function refresh(animate)
+        local enabled = Settings[key]
+        local trackColor = enabled and WHITE or Colors.Off
+        local knobColor = enabled and Color3.fromRGB(14, 14, 17) or Color3.fromRGB(225, 226, 232)
+        local knobPosition = enabled and UDim2.new(1, -21, 0.5, -9) or UDim2.new(0, 3, 0.5, -9)
+        if animate then
+            TweenService:Create(track, info, {BackgroundColor3 = trackColor}):Play()
+            TweenService:Create(knob, info, {BackgroundColor3 = knobColor, Position = knobPosition}):Play()
+        else
+            track.BackgroundColor3 = trackColor
+            knob.BackgroundColor3 = knobColor
+            knob.Position = knobPosition
+        end
+    end
+
+    track.MouseButton1Click:Connect(function()
+        Settings[key] = not Settings[key]
+        refresh(true)
+        if TOAST_TOGGLES[key] then
+            notify(title .. ": " .. (Settings[key] and "ON" or "OFF"), Settings[key] and "success" or "info")
+        end
+    end)
+    refresh(false)
+    table.insert(Refreshers, function() refresh(false) end)
+    return row
+end
+
+local function createSlider(parent, title, description, key, minValue, maxValue, step)
+    local row = createRow(parent, title, description, 64)
+    local valueLabel = makeLabel(row, "", UDim2.new(1, -164, 0, 8), UDim2.fromOffset(150, 16), 12, WHITE, Fonts.Bold, Enum.TextXAlignment.Right)
+
+    local track = Instance.new("Frame")
+    track.Position = UDim2.new(1, -164, 0, 42)
+    track.Size = UDim2.fromOffset(150, 4)
+    track.BackgroundColor3 = Colors.Track
+    track.BorderSizePixel = 0
+    track.Active = true
+    track.Parent = row
+    round(track, 2)
+
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = WHITE
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    round(fill, 2)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(14, 14)
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.BackgroundColor3 = WHITE
+    knob.BorderSizePixel = 0
+    knob.Active = true
+    knob.Parent = track
+    round(knob, 7)
+
+    local decimals = (step < 1) and 2 or 0
+    local format = "%." .. decimals .. "f"
+
+    local function refresh()
+        local value = math.clamp(tonumber(Settings[key]) or minValue, minValue, maxValue)
+        local ratio = (value - minValue) / (maxValue - minValue)
+        fill.Size = UDim2.new(ratio, 0, 1, 0)
+        knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+        valueLabel.Text = string.format(format, value)
+    end
+
+    local function setFromX(mouseX)
+        local width = track.AbsoluteSize.X
+        if width <= 0 then return end
+        local ratio = math.clamp((mouseX - track.AbsolutePosition.X) / width, 0, 1)
+        local raw = minValue + (maxValue - minValue) * ratio
+        local value = minValue + math.floor((raw - minValue) / step + 0.5) * step
+        Settings[key] = tonumber(string.format(format, math.clamp(value, minValue, maxValue)))
+        refresh()
+    end
+
+    local function begin(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            setFromX(input.Position.X)
+            Drag.Handler = setFromX
+        end
+    end
+    track.InputBegan:Connect(begin)
+    knob.InputBegan:Connect(begin)
+
+    refresh()
+    table.insert(Refreshers, refresh)
+    return row
+end
+
+-- Left click = next option, right click = previous option.
+local function createDropdown(parent, title, description, key, options)
+    local row = createRow(parent, title, description, 58)
+    local button = createRowButton(row)
+
+    local function refresh() button.Text = tostring(Settings[key]) .. "  ▾" end
+    local function cycle(step)
+        local index = table.find(options, Settings[key]) or 0
+        Settings[key] = options[((index - 1 + step) % #options) + 1]
+        refresh()
+    end
+    button.MouseButton1Click:Connect(function() cycle(1) end)
+    button.MouseButton2Click:Connect(function() cycle(-1) end)
+
+    refresh()
+    table.insert(Refreshers, refresh)
+    return row
+end
+
+local function createActionButton(parent, title, description, buttonText, callback, danger)
+    local row = createRow(parent, title, description, 58)
+    local button = createRowButton(row, Fonts.Bold)
+    button.Text = buttonText
+    if danger then
+        button.BackgroundColor3 = Color3.fromRGB(44, 18, 22)
+        button.TextColor3 = Color3.fromRGB(255, 150, 158)
+    end
+    button.MouseButton1Click:Connect(callback)
+    return row
+end
+
+-- ============================================================
+-- Pages
+-- ============================================================
+do -- AIMBOT
+    local page = Pages[1]
+    createSection(page, "AIM ASSIST")
+    createToggle(page, "Aimbot", "Aims at the best candidate inside the FOV.", "Aimbot")
+    createDropdown(page, "Activation", "RMB / LMB = hold the button, Always = constant aim.", "AimbotActivation", {"RMB", "LMB", "Always"})
+    createDropdown(page, "Aim Mode", "Camera = turn view, Mouse = move cursor (mousemoverel).", "AimbotMode", {"Camera", "Mouse"})
+    createSlider(page, "FOV Radius", "Max pixel distance from the aim point for targets.", "AimbotFOV", 10, 360, 5)
+    createSlider(page, "Smoothness", "Lower = slower movement, higher = snappier.", "AimbotSmoothness", 0.05, 1.00, 0.05)
+    createSlider(page, "Prediction", "Leads moving targets (seconds). 0 = off.", "AimbotPrediction", 0, 0.30, 0.01)
+    createSlider(page, "Tracking", "Keeps the aim on moving targets (0 = off, 1 = full).", "AimbotTracking", 0, 1, 0.05)
+    createSlider(page, "Max Distance", "Ignores targets farther than this (studs).", "AimbotMaxDistance", 50, 2000, 50)
+    createDropdown(page, "Target Part", "Body part used as the aim reference point.", "AimbotPart", {"Head", "HumanoidRootPart", "UpperTorso", "Torso"})
+    createToggle(page, "Team Check", "Skips teammates (aimbot and ESP).", "TeamCheck")
+    createToggle(page, "Visibility Check", "Raycast check: rejects targets behind walls.", "VisibleCheck")
+    createToggle(page, "Show FOV Circle", "Draws the aimbot FOV on screen (visual only).", "ShowFOV")
+end
+
+do -- ESP
+    local page = Pages[2]
+    createSection(page, "ESP")
+    createToggle(page, "Skeleton", "Draws bones on every player (R15 and R6).", "ESPSkeleton")
+    createSlider(page, "Skeleton Thickness", "Line width of the skeleton in pixels.", "SkeletonThickness", 0.5, 4, 0.5)
+    createToggle(page, "Distance", "Shows the distance under the player, in meters (M).", "ESPDistance")
+end
+
+do -- CONFIG
+    local page = Pages[3]
+    createSection(page, "CONFIGURATION")
+    createActionButton(page, "Reset Settings", "Restores the default settings.", "RESET", function()
+        for key, value in pairs(Defaults) do Settings[key] = value end
+        for _, refresh in ipairs(Refreshers) do pcall(refresh) end
+        notify("Settings reset to defaults", "success")
+    end)
+    createActionButton(page, "Unload", "Turns everything off and removes the menu. No need to leave the game.", "UNLOAD", function()
+        Runtime.Unload()
+    end, true)
+    createSection(page, "ABOUT")
+    createRow(page, "vanta.lol v" .. VERSION, "RightShift opens or closes the menu.", 54, 20)
+    createRow(page, "Credits", "owned by maks and maciek", 54, 20)
+end
+
+selectTab(1)
+
+-- ============================================================
+-- Window dragging, open / close
+-- ============================================================
+do
+    local dragging, dragStart, startPosition = false, nil, nil
+
+    Header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPosition = Main.Position
+        end
+    end)
+    Input.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = input.Position - dragStart
+            local camera = workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+            local limitX = math.max(viewport.X / 2 - 80, 0)
+            local limitY = math.max(viewport.Y / 2 - 40, 0)
+            Main.Position = UDim2.new(
+                startPosition.X.Scale, math.clamp(startPosition.X.Offset + delta.X, -limitX, limitX),
+                startPosition.Y.Scale, math.clamp(startPosition.Y.Offset + delta.Y, -limitY, limitY))
+        end
+    end)
+    Input.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+end
+
+local MenuCursor = {Behavior = nil, IconEnabled = nil, Connection = nil}
+
+local function openMenu()
+    if menuOpen then return end
+    menuOpen = true
+    MenuCursor.Behavior = UserInputService.MouseBehavior
+    MenuCursor.IconEnabled = UserInputService.MouseIconEnabled
+
+    ScreenGui.Enabled = true
+    Main.Visible = true
+    Main.Position = UDim2.fromScale(0.5, 0.5)
+
+    MainScale.Scale = 0.95
+    TweenService:Create(MainScale, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1}):Play()
+
+    -- Keep the cursor free while the menu is open (games often re-lock it every frame).
+    if MenuCursor.Connection then MenuCursor.Connection:Disconnect() end
+    MenuCursor.Connection = RunService.RenderStepped:Connect(function()
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+        if not ScreenGui.Enabled then ScreenGui.Enabled = true end
+        if not Main.Visible then Main.Visible = true end
+    end)
+end
+
+local function closeMenu()
+    if not menuOpen then return end
+    menuOpen = false
+    Main.Visible = false
+    if MenuCursor.Connection then
+        MenuCursor.Connection:Disconnect()
+        MenuCursor.Connection = nil
+    end
+    if MenuCursor.Behavior ~= nil then UserInputService.MouseBehavior = MenuCursor.Behavior end
+    if MenuCursor.IconEnabled ~= nil then UserInputService.MouseIconEnabled = MenuCursor.IconEnabled end
+    MenuCursor.Behavior, MenuCursor.IconEnabled = nil, nil
+end
+
+Close.MouseButton1Click:Connect(closeMenu)
+Input.InputBegan:Connect(function(input)
+    if input.KeyCode == MENU_KEY and not UserInputService:GetFocusedTextBox() then
+        if menuOpen then closeMenu() else openMenu() end
+    end
+end)
+
+-- ============================================================
+-- Targeting
+-- ============================================================
+local VisibilityParams = RaycastParams.new()
+VisibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+VisibilityParams.IgnoreWater = true
+VisibilityParams.RespectCanCollide = true -- ghost parts (accessories, triggers) do not block the ray
+local visibilityFilterCharacter = nil
+
+local function refreshVisibilityFilter()
+    local character = LocalPlayer.Character
+    if character ~= visibilityFilterCharacter then
+        visibilityFilterCharacter = character
+        VisibilityParams.FilterDescendantsInstances = character and {character} or {}
+    end
+end
+
+local VISIBILITY_PARTS = {"Head", "UpperTorso", "HumanoidRootPart", "Torso"}
+
+-- True when at least one body part is not blocked by geometry.
+local function isCharacterVisible(character, camera)
+    local origin = camera.CFrame.Position
+    for _, partName in ipairs(VISIBILITY_PARTS) do
+        local part = character:FindFirstChild(partName)
+        if part and part:IsA("BasePart") then
+            local result = workspace:Raycast(origin, part.Position - origin, VisibilityParams)
+            if result == nil or result.Instance:IsDescendantOf(character) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function getCharacterPart(character, partName)
+    local requested = character:FindFirstChild(partName)
+    if requested and requested:IsA("BasePart") then return requested end
+    local head = character:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then return root end
+    return nil
+end
+
+local function isTeammate(player)
+    return LocalPlayer.Team ~= nil and player.Team == LocalPlayer.Team
+end
+
+-- Returns the part to aim at and its pixel distance from `reference`, or nil when the player is not a valid target.
+-- Cheap checks run first, the raycast runs last.
+local function evaluateCandidate(player, camera, reference)
+    local character = player.Character
+    if not character then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return nil end
+    if character:FindFirstChildOfClass("ForceField") then return nil end
+    if Settings.TeamCheck and isTeammate(player) then return nil end
+
+    local part = getCharacterPart(character, Settings.AimbotPart)
+    if not part then return nil end
+
+    if (part.Position - camera.CFrame.Position).Magnitude > Settings.AimbotMaxDistance then return nil end
+
+    local screen, onScreen = camera:WorldToViewportPoint(part.Position)
+    if not onScreen or screen.Z <= 0 then return nil end
+    local pixelDistance = (Vector2.new(screen.X, screen.Y) - reference).Magnitude
+    if pixelDistance > Settings.AimbotFOV then return nil end
+
+    if Settings.VisibleCheck and not isCharacterVisible(character, camera) then return nil end
+    return part, pixelDistance
+end
+
+-- Closest valid target to `reference`. Returns part, player.
+local function findBestTarget(camera, reference)
+    local bestPart, bestPlayer, bestDistance = nil, nil, math.huge
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local part, distance = evaluateCandidate(player, camera, reference)
+            if part and distance < bestDistance then
+                bestPart, bestPlayer, bestDistance = part, player, distance
+            end
+        end
+    end
+    return bestPart, bestPlayer
+end
+
+-- ============================================================
+-- Aimbot
+-- ============================================================
+local AimCircle = Instance.new("Frame")
+AimCircle.Name = "AimFOVCircle"
+AimCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+AimCircle.BackgroundTransparency = 1
+AimCircle.BorderSizePixel = 0
+AimCircle.Visible = false
+AimCircle.ZIndex = 20
+AimCircle.Parent = ScreenGui
+round(AimCircle, 1000)
+stroke(AimCircle, WHITE, 1.5, 0.2)
+
+local Aimbot = {LockedPlayer = nil, MouseWarned = false, MouseResidual = Vector2.new()}
+
+local function isAimActive()
+    local mode = Settings.AimbotActivation
+    if mode == "Always" then return true end
+    local button = (mode == "LMB") and Enum.UserInputType.MouseButton1 or Enum.UserInputType.MouseButton2
+    return UserInputService:IsMouseButtonPressed(button)
+end
+
+-- Mouse mode targets around the cursor (when it is free), Camera mode around the screen center.
+local function getAimReference(camera)
+    if Settings.AimbotMode == "Mouse" and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+        return UserInputService:GetMouseLocation()
+    end
+    return camera.ViewportSize / 2
+end
+
+local function aimAt(camera, targetPart, reference, dt)
+    -- Frame-rate independent smoothing: same feel at 60 and 240 FPS.
+    local frameTime = math.clamp(dt or (1 / 60), 0, 0.1)
+    local smoothness = math.clamp(Settings.AimbotSmoothness, 0.01, 1)
+    local alpha = 1 - (1 - smoothness) ^ (frameTime * 60)
+
+    -- Smoothing makes the aim trail behind a moving target; "Tracking" aims that much ahead.
+    local trailTime = 0
+    if alpha > 0 then trailTime = math.min(frameTime * (1 - alpha) / alpha, 0.25) end
+    local leadTime = Settings.AimbotPrediction + trailTime * Settings.AimbotTracking
+    local aimPosition = targetPart.Position + targetPart.AssemblyLinearVelocity * leadTime
+
+    if Settings.AimbotMode == "Mouse" then
+        if type(mousemoverel) == "function" then
+            local screenPoint, onScreen = camera:WorldToViewportPoint(aimPosition)
+            if onScreen and screenPoint.Z > 0 then
+                -- mousemoverel only takes whole pixels: keep the fractional rest so slow tracking never stalls.
+                local residual = Aimbot.MouseResidual
+                    + Vector2.new(screenPoint.X - reference.X, screenPoint.Y - reference.Y) * alpha
+                local stepX = residual.X >= 0 and math.floor(residual.X) or math.ceil(residual.X)
+                local stepY = residual.Y >= 0 and math.floor(residual.Y) or math.ceil(residual.Y)
+                if stepX ~= 0 or stepY ~= 0 then
+                    pcall(mousemoverel, stepX, stepY)
+                    residual = residual - Vector2.new(stepX, stepY)
+                end
+                Aimbot.MouseResidual = residual
+            else
+                Aimbot.MouseResidual = Vector2.new()
+            end
+            return
+        elseif not Aimbot.MouseWarned then
+            Aimbot.MouseWarned = true
+            notify("mousemoverel() not available - using Camera mode", "error")
+        end
+    end
+
+    camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(camera.CFrame.Position, aimPosition), alpha)
+end
+
+local function updateAimbot(camera, dt)
+    local reference = getAimReference(camera)
+    AimCircle.Visible = Settings.Aimbot and Settings.ShowFOV
+    if AimCircle.Visible then
+        AimCircle.Position = UDim2.fromOffset(reference.X, reference.Y)
+        AimCircle.Size = UDim2.fromOffset(Settings.AimbotFOV * 2, Settings.AimbotFOV * 2)
+    end
+
+    if not Settings.Aimbot or menuOpen or not isAimActive() then
+        Aimbot.LockedPlayer = nil
+        Aimbot.MouseResidual = Vector2.new()
+        return
+    end
+
+    -- Target lock: keep the current target while it stays valid (no flicker between targets).
+    local targetPart = nil
+    if Aimbot.LockedPlayer then
+        targetPart = evaluateCandidate(Aimbot.LockedPlayer, camera, reference)
+    end
+    if not targetPart then
+        targetPart, Aimbot.LockedPlayer = findBestTarget(camera, reference)
+    end
+
+    if targetPart then
+        aimAt(camera, targetPart, reference, dt)
+    end
+end
+
+-- ============================================================
+-- ESP: skeleton + distance
+-- ============================================================
+local PlayerOverlays = {}
+
+local R15_BONES = {
+    {"Head", "UpperTorso"}, {"UpperTorso", "LowerTorso"},
+    {"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"}, {"LeftLowerArm", "LeftHand"},
+    {"UpperTorso", "RightUpperArm"}, {"RightUpperArm", "RightLowerArm"}, {"RightLowerArm", "RightHand"},
+    {"LowerTorso", "LeftUpperLeg"}, {"LeftUpperLeg", "LeftLowerLeg"}, {"LeftLowerLeg", "LeftFoot"},
+    {"LowerTorso", "RightUpperLeg"}, {"RightUpperLeg", "RightLowerLeg"}, {"RightLowerLeg", "RightFoot"},
+}
+local R6_BONES = {
+    {"Head", "Torso"}, {"Torso", "Left Arm"}, {"Torso", "Right Arm"},
+    {"Torso", "Left Leg"}, {"Torso", "Right Leg"},
+}
+
+-- Draws a line between two screen points using a centered, rotated frame.
+local function setLine(frame, a, b, thickness)
+    local delta = b - a
+    frame.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+    frame.Size = UDim2.fromOffset(delta.Magnitude, thickness)
+    frame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+    frame.Visible = true
+end
+
+local function hideBones(overlay)
+    for _, bone in ipairs(overlay.Bones) do bone.Visible = false end
+end
+
+local function hideOverlay(overlay)
+    overlay.Distance.Visible = false
+    hideBones(overlay)
+end
+
+local function removePlayerOverlay(player)
+    local overlay = PlayerOverlays[player]
+    if not overlay then return end
+    pcall(function() overlay.Distance:Destroy() end)
+    for _, bone in ipairs(overlay.Bones) do
+        pcall(function() bone:Destroy() end)
+    end
+    PlayerOverlays[player] = nil
+end
+
+local function createPlayerOverlay(player)
+    if player == LocalPlayer or PlayerOverlays[player] then return end
+    local id = tostring(player.UserId)
+
+    local bones = {}
+    for i = 1, #R15_BONES do
+        local bone = Instance.new("Frame")
+        bone.Name = "ESPBone_" .. id .. "_" .. i
+        bone.AnchorPoint = Vector2.new(0.5, 0.5)
+        bone.BackgroundColor3 = WHITE
+        bone.BorderSizePixel = 0
+        bone.Visible = false
+        bone.ZIndex = 28
+        bone.Parent = ScreenGui
+        bones[i] = bone
+    end
+
+    local distance = Instance.new("TextLabel")
+    distance.Name = "ESPDistance_" .. id
+    distance.BackgroundTransparency = 1
+    distance.BorderSizePixel = 0
+    distance.Size = UDim2.fromOffset(80, 16)
+    distance.Font = Fonts.Bold
+    distance.TextSize = 13
+    distance.TextColor3 = WHITE
+    distance.TextStrokeColor3 = Color3.new(0, 0, 0)
+    distance.TextStrokeTransparency = 0.3
+    distance.TextXAlignment = Enum.TextXAlignment.Center
+    distance.Visible = false
+    distance.ZIndex = 31
+    distance.Parent = ScreenGui
+
+    PlayerOverlays[player] = {Bones = bones, Distance = distance}
+end
+
+local function updateSkeleton(overlay, character, camera)
+    local bones = character:FindFirstChild("UpperTorso") and R15_BONES or R6_BONES
+    for i, frame in ipairs(overlay.Bones) do
+        local drawn = false
+        local pair = bones[i]
+        if pair then
+            local partA = character:FindFirstChild(pair[1])
+            local partB = character:FindFirstChild(pair[2])
+            if partA and partB then
+                local a = camera:WorldToViewportPoint(partA.Position)
+                local b = camera:WorldToViewportPoint(partB.Position)
+                if a.Z > 0 and b.Z > 0 then
+                    setLine(frame, Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y), Settings.SkeletonThickness)
+                    drawn = true
+                end
+            end
+        end
+        if not drawn then frame.Visible = false end
+    end
+end
+
+local function updatePlayerOverlay(player, overlay, camera)
+    if not Settings.ESPSkeleton and not Settings.ESPDistance then return hideOverlay(overlay) end
+
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not root then return hideOverlay(overlay) end
+    if Settings.TeamCheck and isTeammate(player) then return hideOverlay(overlay) end
+
+    local rootScreen, onScreen = camera:WorldToViewportPoint(root.Position)
+    if not onScreen or rootScreen.Z <= 0 then return hideOverlay(overlay) end
+
+    if Settings.ESPSkeleton then
+        updateSkeleton(overlay, character, camera)
+    else
+        hideBones(overlay)
+    end
+
+    overlay.Distance.Visible = Settings.ESPDistance
+    if Settings.ESPDistance then
+        local feet = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+        local localRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local origin = localRoot and localRoot.Position or camera.CFrame.Position
+        local meters = math.floor((root.Position - origin).Magnitude + 0.5)
+        overlay.Distance.Position = UDim2.fromOffset(feet.X - 40, feet.Y + 2)
+        overlay.Distance.Text = meters .. "M"
+    end
+end
+
+for _, player in ipairs(Players:GetPlayers()) do createPlayerOverlay(player) end
+local playerAddedConnection = Players.PlayerAdded:Connect(createPlayerOverlay)
+local playerRemovingConnection = Players.PlayerRemoving:Connect(function(player)
+    if Aimbot.LockedPlayer == player then Aimbot.LockedPlayer = nil end
+    removePlayerOverlay(player)
+end)
+
+-- ============================================================
+-- Main loop
+-- ============================================================
+local function updateFeatures(dt)
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    refreshVisibilityFilter()
+    updateAimbot(camera, dt)
+
+    for player, overlay in pairs(PlayerOverlays) do
+        updatePlayerOverlay(player, overlay, camera)
+    end
+end
+
+-- UnbindFromRenderStep first: avoids "already bound" errors when the script is executed twice.
+pcall(function() RunService:UnbindFromRenderStep(RENDER_STEP_NAME) end)
+RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, updateFeatures)
+
+-- ============================================================
+-- Unload
+-- ============================================================
+local cleanedUp = false
+local function cleanup()
+    if cleanedUp then return end
+    cleanedUp = true
+
+    for _, connection in ipairs(Runtime.Connections) do pcall(function() connection:Disconnect() end) end
+    Runtime.Connections = {}
+
+    pcall(function() RunService:UnbindFromRenderStep(RENDER_STEP_NAME) end)
+    if playerAddedConnection then playerAddedConnection:Disconnect() end
+    if playerRemovingConnection then playerRemovingConnection:Disconnect() end
+    if MenuCursor.Connection then MenuCursor.Connection:Disconnect() end
+    if TabAnimation.Indicator then TabAnimation.Indicator:Cancel() end
+    for _, tween in pairs(TabAnimation.Pages) do pcall(function() tween:Cancel() end) end
+    for _, tween in pairs(ScrollTweens) do pcall(function() tween:Cancel() end) end
+    for player in pairs(PlayerOverlays) do removePlayerOverlay(player) end
+
+    if menuOpen then
+        menuOpen = false
+        if MenuCursor.Behavior ~= nil then UserInputService.MouseBehavior = MenuCursor.Behavior end
+        if MenuCursor.IconEnabled ~= nil then UserInputService.MouseIconEnabled = MenuCursor.IconEnabled end
+    end
+
+    if globalEnv.__VantaLolCleanup == cleanup then globalEnv.__VantaLolCleanup = nil end
+    pcall(function() ScreenGui:Destroy() end)
+end
+
+ScreenGui.Destroying:Connect(cleanup)
+Runtime.Unload = cleanup
+globalEnv.__VantaLolCleanup = cleanup
+
+print("[vanta.lol] Version " .. VERSION .. " loaded. GUI parent: " .. GuiParentName .. ". Press RightShift to open the menu.")
+
+-- owned by maks and maciek
